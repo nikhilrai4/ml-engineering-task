@@ -8,9 +8,145 @@ TARGET: beam equivalent of your multiprocessing pipeline:
   6) write single-line `output.json` (pandas to_json format)
 runs in parallel on directrunner using the chosen running mode and worker count.
 """
+import json
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, DirectOptions
 from apache_beam.io import fileio
+from typing import Any, Dict, Iterable, List, Tuple
+
+
+# ------------------------------- JSON reading -------------------------------- #
+
+def _is_dict_of_dicts(obj: Dict[str, Any]) -> bool:
+    """Returns True if all top-level values are dicts (column -> {index: value})."""
+    if not isinstance(obj, dict) or not obj:
+        return False
+    return all(isinstance(v, dict) for v in obj.values())
+
+
+def _rows_from_dict_of_dicts(obj: Dict[str, Dict[str, Any]]) -> Iterable[Dict]:
+    """
+    flatten pandas 'orient=columns' JSON:
+      { col: { index: value }, ... }  -->  rows: [{col: value, ...}, ...]
+    * uses the union of indices across columns (missing -> None)
+    * sorts indices numerically if they look like integers otherwise alphabetically
+    """
+    # union of all index keys across columns
+    all_idx_keys = set()
+    for col_dict in obj.values():
+        all_idx_keys.update(col_dict.keys())
+
+    def _int_like(s: str) -> bool:
+        try:
+            int(s)
+            return True
+        except Exception:
+            return False
+
+    # sort indices
+    if all(_int_like(k) for k in all_idx_keys):
+        ordered_keys = sorted(all_idx_keys, key=lambda k: int(k))
+    else:
+        ordered_keys = sorted(all_idx_keys)
+
+    # emit rows
+    for idx in ordered_keys:
+        row = {col: col_dict.get(idx) for col, col_dict in obj.items()}
+        yield row
+
+
+def _rows_from_json_obj(obj: Any) -> Iterable[Dict]:
+    """
+    convert loaded JSON into row dicts:
+      - list[dict] -> rows
+      - dict[str, list] -> column-oriented lists (expand)
+      - dict[str, dict] -> column-oriented dicts (expand)
+      - dict[str, scalar] -> single row
+    """
+    if isinstance(obj, list):
+        for item in obj:
+            if not isinstance(item, dict):
+                raise ValueError("JSON array must contain dict objects.")
+            yield item
+
+    elif isinstance(obj, dict):
+        values = list(obj.values())
+        if values and all(isinstance(v, list) for v in values):
+            # dict-of-lists
+            lengths = {len(v) for v in values}
+            if len(lengths) != 1:
+                raise ValueError("Column-oriented JSON has inconsistent list lengths.")
+            n = next(iter(lengths))
+            keys = list(obj.keys())
+            for i in range(n):
+                yield {k: obj[k][i] for k in keys}
+        elif _is_dict_of_dicts(obj):
+            # dict-of-dicts (pandas default to_json orient='columns')
+            yield from _rows_from_dict_of_dicts(obj)
+        else:
+            # Single record
+            yield obj
+
+    else:
+        raise ValueError("Unsupported top-level JSON type. Must be object or array.")
+    
+
+def _rows_from_json_obj(obj: Any) -> Iterable[Dict]:
+    """
+    Convert loaded JSON into row dicts:
+      - list[dict]           -> rows
+      - dict[str, list]      -> column-oriented lists (expand)
+      - dict[str, dict]      -> column-oriented dicts (expand)  <-- your case
+      - dict[str, scalar]    -> single row
+    """
+    if isinstance(obj, list):
+        for item in obj:
+            if not isinstance(item, dict):
+                raise ValueError("JSON array must contain dict objects.")
+            yield item
+
+    elif isinstance(obj, dict):
+        values = list(obj.values())
+        if values and all(isinstance(v, list) for v in values):
+            # dict-of-lists
+            lengths = {len(v) for v in values}
+            if len(lengths) != 1:
+                raise ValueError("Column-oriented JSON has inconsistent list lengths.")
+            n = next(iter(lengths))
+            keys = list(obj.keys())
+            for i in range(n):
+                yield {k: obj[k][i] for k in keys}
+        elif _is_dict_of_dicts(obj):
+            # dict-of-dicts (pandas default to_json orient='columns')
+            yield from _rows_from_dict_of_dicts(obj)
+        else:
+            # Single record
+            yield obj
+
+    else:
+        raise ValueError("Unsupported top-level JSON type. Must be object or array.")
+    
+class ReadJsonFlexibleAsRows(beam.DoFn):
+    """
+    Reads full file content and yields row dicts.
+    - First tries as a single JSON document (array/object).
+    - If that fails, falls back to NDJSON (one JSON object per line).
+    """
+    def process(self, file_content: str) -> Iterable[Dict]:
+        txt = file_content.strip()
+        if not txt:
+            return
+        try:
+            obj = json.loads(txt)
+            yield from _rows_from_json_obj(obj)
+            return
+        except json.JSONDecodeError:
+            # Fallback: NDJSON
+            for line in txt.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                yield json.loads(line)
 
 def run_beam(method: str,
     pool_over: str):
@@ -33,5 +169,6 @@ def run_beam(method: str,
             | "Match Input" >> fileio.MatchFiles("data.json")
             | "Read files" >> fileio.ReadMatches()           
             | "Read contents" >> beam.Map(lambda file: file.read_utf8())
+            | "Parse JSON" >> beam.ParDo(ReadJsonFlexibleAsRows())
             | "Log" >> beam.Map(print)    # Debug step
         )
