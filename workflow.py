@@ -222,5 +222,6 @@ def run_beam(method: str,
             | "Read contents" >> beam.Map(lambda file: file.read_utf8())
             | "Parse JSON" >> beam.ParDo(ReadJsonFlexibleAsRows())
             | "Normalize fields" >> beam.ParDo(NormalizeForProcessing(pool_over))
+            | "Key by pool_over" >> beam.Map(lambda r: (r[pool_over], r))
             | "Log" >> beam.Map(print)    # Debug step
         )
