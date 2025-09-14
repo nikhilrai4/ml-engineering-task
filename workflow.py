@@ -13,7 +13,8 @@ import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, DirectOptions
 from apache_beam.io import fileio
 from typing import Any, Dict, Iterable, List, Tuple
-
+from processing import process
+import pandas as pd
 
 # ------------------------------- JSON reading -------------------------------- #
 
@@ -197,7 +198,40 @@ class NormalizeForProcessing(beam.DoFn):
             row["item_id"] = _normalize_item_id(row["item_id"])
         yield row
 
+# -------------------------- group & call process() ------------------------- #
 
+_NUMERIC_COLS = [
+    "promo_quantity",
+    "sales_quantity",
+    "effective_discount",
+    "theoretical_discount",
+]
+
+class ProcessGroup(beam.DoFn):
+    """
+    For each (key, rows):
+      - Build DataFrame
+      - Coerce numeric columns used by your logic
+      - Call processing.process(df, method) -> (out_df, failed)
+      - Emit rows of out_df as dicts (records)
+    """
+    def __init__(self, method: str):
+        self.method = method
+
+    def process(self, kv: Tuple[Any, Iterable[Dict]]) -> Iterable[Dict]:
+        group_key, rows_iter = kv
+        rows = list(rows_iter)
+        if not rows:
+            return
+
+        df = pd.DataFrame(rows)
+
+        # Call processing.process function
+        out_df, _failed = process(df, self.method)
+
+        # Emit as records
+        for rec in out_df.to_dict(orient="records"):
+            yield rec
 
 def run_beam(method: str,
     pool_over: str):
@@ -224,5 +258,6 @@ def run_beam(method: str,
             | "Normalize fields" >> beam.ParDo(NormalizeForProcessing(pool_over))
             | "Key by pool_over" >> beam.Map(lambda r: (r[pool_over], r))
             | "GroupByKey" >> beam.GroupByKey()
+            | "Process groups" >> beam.ParDo(ProcessGroup(method))
             | "Log" >> beam.Map(print)    # Debug step
         )
