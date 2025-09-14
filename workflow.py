@@ -284,37 +284,49 @@ class RecordsToSingleJsonString(beam.CombineFn):
         return df.to_json(double_precision=10)
 
 
-def run_beam(method: str,
-    pool_over: str):
-    # Configure pipeline options
-    options = PipelineOptions(
-        runner="DirectRunner",       # Local execution or "DataflowRunner" for GCP
-        save_main_session=True       # Ensures global imports are available on workers
+# --------------------------------- Runner ------------------------------------ #
+
+def run_beam(
+    method: str,
+    pool_over: str,
+    input_path: str = "data.json",
+    output_path: str = "output.json",
+    direct_running_mode: str = "multi_threading",  # or 'multi_processing' (use with care for PyTorch)
+    direct_num_workers: int = 4,
+    remaining_args=None
+) -> None:
+    opts = PipelineOptions(
+        remaining_args or [],
+        runner="DirectRunner",  # or "DataflowRunner" for GCP
+        save_main_session=True
     )
+    direct_opts = opts.view_as(DirectOptions)
+    direct_opts.direct_running_mode = direct_running_mode
+    direct_opts.direct_num_workers = direct_num_workers
 
-    # DirectRunner-specific options
-    direct_opts = options.view_as(DirectOptions)
-    direct_opts.direct_running_mode = "multi_threading"  # or "multi_processing"
-    direct_opts.direct_num_workers = 4
-
-    # Create and run the pipeline
-    with beam.Pipeline(options=options) as p:
-        (
+    with beam.Pipeline(options=opts) as p:
+        rows = (
             p
-            | "Start" >> beam.Create([])  # Placeholder for now
-            | "Match Input" >> fileio.MatchFiles("data.json")
-            | "Read files" >> fileio.ReadMatches()           
-            | "Read contents" >> beam.Map(lambda file: file.read_utf8())
+            | "Match input" >> fileio.MatchFiles(input_path)
+            | "Read files" >> fileio.ReadMatches()
+            | "Read UTF8" >> beam.Map(lambda r: r.read_utf8())
             | "Parse JSON" >> beam.ParDo(ReadJsonFlexibleAsRows())
-            | "Normalize fields" >> beam.ParDo(NormalizeForProcessing(pool_over))
+#            | "Normalize fields" >> beam.ParDo(NormalizeForProcessing(pool_over))
+        )
+
+        processed_records = (
+            rows
             | "Key by pool_over" >> beam.Map(lambda r: (r[pool_over], r))
             | "GroupByKey" >> beam.GroupByKey()
             | "Process groups" >> beam.ParDo(ProcessGroup(method))
+        )
+
+        (
+            processed_records
             | "To single JSON string" >> beam.CombineGlobally(RecordsToSingleJsonString()).without_defaults()
             | "Write output.json" >> beam.io.WriteToText(
-                "output.json",
+                output_path,
                 num_shards=1,
                 shard_name_template="",  # exact filename (no sharding suffix)
             )
-            | "Log" >> beam.Map(print)    # Debug step
         )
