@@ -148,6 +148,57 @@ class ReadJsonFlexibleAsRows(beam.DoFn):
                     continue
                 yield json.loads(line)
 
+# ------------------------------ normalization -------------------------------- #
+
+_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+def _to_scalar(value: Any) -> Any:
+    """
+    make value hashable/pandas-friendly:
+      - If scalar -> keep
+      - If dict/list -> deterministic JSON string
+    """
+    if isinstance(value, _SCALAR_TYPES):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _normalize_item_id(value: Any) -> Any:
+    """
+    Ensure "pool_over" is a scalar (preferred id-like key if present).
+    """
+    if isinstance(value, _SCALAR_TYPES):
+        return value
+    if isinstance(value, dict):
+        for k in ("id", "item_id", "sku", "code"):
+            v = value.get(k)
+            if isinstance(v, _SCALAR_TYPES):
+                return v
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], _SCALAR_TYPES):
+        return value[0]
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+class NormalizeForProcessing(beam.DoFn):
+    """
+    normalize critical fields before grouping/processing:
+      - `pool_over` (group key used by GroupByKey)
+      - `item_id` (required by processing.process for .unique())
+    """
+    def __init__(self, pool_over: str):
+        self.pool_over = pool_over
+
+    def process(self, row: Dict) -> Iterable[Dict]:
+        if self.pool_over not in row:
+            raise KeyError(f"Column '{self.pool_over}' not found in input rows.")
+
+        row[self.pool_over] = _to_scalar(row[self.pool_over])
+        if "item_id" in row:
+            row["item_id"] = _normalize_item_id(row["item_id"])
+        yield row
+
+
+
 def run_beam(method: str,
     pool_over: str):
     # Configure pipeline options
@@ -170,5 +221,6 @@ def run_beam(method: str,
             | "Read files" >> fileio.ReadMatches()           
             | "Read contents" >> beam.Map(lambda file: file.read_utf8())
             | "Parse JSON" >> beam.ParDo(ReadJsonFlexibleAsRows())
+            | "Normalize fields" >> beam.ParDo(NormalizeForProcessing(pool_over))
             | "Log" >> beam.Map(print)    # Debug step
         )
