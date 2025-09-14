@@ -209,9 +209,8 @@ _NUMERIC_COLS = [
 
 class ProcessGroup(beam.DoFn):
     """
-    For each (key, rows):
-      - Build DataFrame
-      - Coerce numeric columns used by your logic
+    for each (key, rows):
+      - Build DataFrame from rows
       - Call processing.process(df, method) -> (out_df, failed)
       - Emit rows of out_df as dicts (records)
     """
@@ -233,11 +232,63 @@ class ProcessGroup(beam.DoFn):
         for rec in out_df.to_dict(orient="records"):
             yield rec
 
+# ----------------------- Combine to Pandas JSON string ------------------------ #
+
+class RecordsToSingleJsonString(beam.CombineFn):
+    """
+    Combine all records and return a single JSON string identical to:
+        pd.DataFrame(records)
+          .sort_values(by=item_id in natural order)
+          .reset_index(drop=True)
+          .to_json(double_precision=10)
+    (orient='columns' by default) to match your expected output and ordering.
+    """
+    def create_accumulator(self) -> List[Dict]:
+        return []
+
+    def add_input(self, acc: List[Dict], rec: Dict) -> List[Dict]:
+        acc.append(rec)
+        return acc
+
+    def merge_accumulators(self, accs: List[List[Dict]]) -> List[Dict]:
+        merged: List[Dict] = []
+        for a in accs:
+            merged.extend(a)
+        return merged
+
+    def extract_output(self, acc: List[Dict]) -> str:
+        df = pd.DataFrame(acc)
+
+        # Ensure stable column order: item_id first if present
+        if "item_id" in df.columns:
+            # Natural sort for IDs like i1, i2, i10 (prefix + numeric suffix)
+            s = df["item_id"].astype(str)
+            prefix = s.str.replace(r"(\d+)$", "", regex=True)
+            num = s.str.extract(r"(\d+)$", expand=False).fillna("-1").astype(int)
+
+            df = (
+                df.assign(_prefix=prefix, _num=num)
+                  .sort_values(by=["_prefix", "_num", "item_id"], kind="mergesort")
+                  .drop(columns=["_prefix", "_num"])
+                  .reset_index(drop=True)
+            )
+
+            # Put item_id first
+            cols = ["item_id"] + [c for c in df.columns if c != "item_id"]
+            df = df[cols]
+        else:
+            # Still reset index for clean 0..n-1 indices
+            df = df.reset_index(drop=True)
+
+        # Single-line JSON (pandas default has no pretty printing)
+        return df.to_json(double_precision=10)
+
+
 def run_beam(method: str,
     pool_over: str):
     # Configure pipeline options
     options = PipelineOptions(
-        runner="DirectRunner",       # Local execution
+        runner="DirectRunner",       # Local execution or "DataflowRunner" for GCP
         save_main_session=True       # Ensures global imports are available on workers
     )
 
@@ -259,5 +310,11 @@ def run_beam(method: str,
             | "Key by pool_over" >> beam.Map(lambda r: (r[pool_over], r))
             | "GroupByKey" >> beam.GroupByKey()
             | "Process groups" >> beam.ParDo(ProcessGroup(method))
+            | "To single JSON string" >> beam.CombineGlobally(RecordsToSingleJsonString()).without_defaults()
+            | "Write output.json" >> beam.io.WriteToText(
+                "output.json",
+                num_shards=1,
+                shard_name_template="",  # exact filename (no sharding suffix)
+            )
             | "Log" >> beam.Map(print)    # Debug step
         )
