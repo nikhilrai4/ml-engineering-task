@@ -223,5 +223,6 @@ def run_beam(method: str,
             | "Parse JSON" >> beam.ParDo(ReadJsonFlexibleAsRows())
             | "Normalize fields" >> beam.ParDo(NormalizeForProcessing(pool_over))
             | "Key by pool_over" >> beam.Map(lambda r: (r[pool_over], r))
+            | "GroupByKey" >> beam.GroupByKey()
             | "Log" >> beam.Map(print)    # Debug step
         )
