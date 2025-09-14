@@ -124,3 +124,9 @@
 {'item_id': 'i1', 'alpha': 1.0, 'beta': 0.0}
 
 where as expected result is : {"item_id":{"0":"i3","1":"i4","2":"i1","3":"i2"},"alpha":{"0":1.0,"1":1.0,"2":1.0,"3":1.0},"beta":{"0":0.0,"1":0.0,"2":0.0,"3":0.0}}
+
+
+# to do
+
+cleanup the pipeline code.
+initial version of linear regression task is implemented. make sure it is what task 2 demands
