@@ -74,42 +74,63 @@ def process(
     return out, failed
 
 
-def linear_regression(x: np.array, y: np.array) -> tuple[float, float]:
-    # Convert to torch tensors
-    x_tensor = torch.tensor(x, dtype=torch.float32).view(-1, 1)
-    y_tensor = torch.tensor(y, dtype=torch.float32).view(-1, 1)
 
-    # Define model with constraints
-    class ConstrainedLinearModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.intercept_raw = nn.Parameter(torch.tensor([0.5]))
-            self.slope_raw = nn.Parameter(torch.tensor([0.5]))
 
-        def forward(self, x):
-            intercept = torch.clamp(self.intercept_raw, 0.0, 1.0)
-            slope = torch.clamp(self.slope_raw, min=0.0)
-            return intercept + slope * x
+def linear_regression(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """
+    Constrained linear regression on original scale:
+      y_hat = intercept + slope * x,
+      intercept in [0,1], slope >= 0, never returns NaNs.
+    Efficient for tiny problems via LBFGS; falls back safely on any error.
+    """
+    # Ensure 1-D float arrays; drop non-finite
+    x = np.asarray(x, dtype=np.float64).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
 
-    model = ConstrainedLinearModel()
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-
-    # Train the model
-    for _ in range(1000):
-        optimizer.zero_grad()
-        outputs = model(x_tensor)
-        loss = criterion(outputs, y_tensor)
-        loss.backward()
-        optimizer.step()
-
-    # Extract constrained parameters
-    intercept = torch.clamp(model.intercept_raw, 0.0, 1.0).item()
-    slope = torch.clamp(model.slope_raw, min=0.0).item()
-
-    # Ensure no NaNs
-    if np.isnan(intercept) or np.isnan(slope):
+    # Degenerate or too few points → safe default
+    if x.size < 2:
         return 1.0, 0.0
 
-    return intercept, slope
+    # Tensors
+    X = torch.from_numpy(x).to(dtype=torch.float32)
+    Y = torch.from_numpy(y).to(dtype=torch.float32)
+
+    # Unconstrained parameters
+    intercept_raw = nn.Parameter(torch.tensor(0.0))  # intercept via sigmoid
+    slope_raw = nn.Parameter(torch.tensor(0.0))      # slope via softplus
+
+    def intercept_fn():
+        return torch.sigmoid(intercept_raw)          # in [0,1]
+    def slope_fn():
+        return torch.nn.functional.softplus(slope_raw)  # >= 0
+
+    # Small L2 helps robustness; LBFGS converges fast on tiny problems
+    optimizer = optim.LBFGS([intercept_raw, slope_raw], max_iter=60, line_search_fn="strong_wolfe")
+    l2 = 1e-6
+
+    def closure():
+        optimizer.zero_grad(set_to_none=True)
+        yhat = intercept_fn() + slope_fn() * X
+        loss = torch.mean((yhat - Y)**2) + l2*(intercept_raw*intercept_raw + slope_raw*slope_raw)
+        # Guard against NaN/Inf loss (shouldn't happen with this parametrisation)
+        if not torch.isfinite(loss):
+            # Return a finite, high loss to let optimizer back off
+            loss = torch.tensor(1e6, dtype=Y.dtype, requires_grad=True)
+        loss.backward()
+        return loss
+
+    try:
+        optimizer.step(closure)
+        intercept = float(torch.clamp(intercept_fn(), 0.0, 1.0).detach().cpu().numpy())
+        slope = float(torch.clamp(slope_fn(), min=0.0).detach().cpu().numpy())
+        # Final safety: never return NaN
+        if not np.isfinite(intercept) or not np.isfinite(slope):
+            return 1.0, 0.0
+        return intercept, slope
+    except Exception:
+        # Absolute fallback, per spec
+        return 1.0, 0.0
+
 
